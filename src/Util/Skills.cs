@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Reflection;
@@ -74,6 +75,109 @@ namespace EAgentX.Util
 				Log.Error("解压技能包失败: " + ex.Message);
 				return null;
 			}
+		}
+
+		/// <summary>
+		/// 方案三：给 list_skills 工具用。返回 "技能名 — 一句话简介" 列表。
+		/// 技能包是「分类/技能名/SKILL.md」两层结构，技能名取目录名。
+		/// </summary>
+		public static List<string> List(string root)
+		{
+			List<string> lines = new List<string>();
+			try
+			{
+				if (string.IsNullOrEmpty(root) || !Directory.Exists(root))
+				{
+					return lines;
+				}
+				string[] files = Directory.GetFiles(root, "SKILL.md", SearchOption.AllDirectories);
+				Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+				for (int i = 0; i < files.Length; i++)
+				{
+					string name = Path.GetFileName(Path.GetDirectoryName(files[i]));
+					string summary = FirstSummary(files[i]);
+					lines.Add((summary.Length == 0) ? name : (name + " — " + summary));
+				}
+			}
+			catch
+			{
+			}
+			return lines;
+		}
+
+		/// <summary>按技能名（目录名，或「分类/技能名」）定位 SKILL.md；找不到返回 null。</summary>
+		public static string FindSkillFile(string root, string name)
+		{
+			try
+			{
+				if (string.IsNullOrEmpty(root) || string.IsNullOrEmpty(name) || !Directory.Exists(root))
+				{
+					return null;
+				}
+				string target = name.Replace('\\', '/').Trim().Trim('/');
+				string[] files = Directory.GetFiles(root, "SKILL.md", SearchOption.AllDirectories);
+				string loose = null;
+				for (int i = 0; i < files.Length; i++)
+				{
+					string folder = Path.GetDirectoryName(files[i]);
+					string leaf = Path.GetFileName(folder);
+					string relative = folder.Substring(root.Length).Replace('\\', '/').Trim('/');
+					if (string.Equals(relative, target, StringComparison.OrdinalIgnoreCase))
+					{
+						return files[i];
+					}
+					if (string.Equals(leaf, target, StringComparison.OrdinalIgnoreCase) && loose == null)
+					{
+						loose = files[i];
+					}
+				}
+				return loose;
+			}
+			catch
+			{
+				return null;
+			}
+		}
+
+		/// <summary>取 SKILL.md 里的第一段有效说明（跳过标题、空行与 front matter）。</summary>
+		private static string FirstSummary(string file)
+		{
+			try
+			{
+				string[] lines = File.ReadAllLines(file);
+				bool inFrontMatter = false;
+				for (int i = 0; i < lines.Length && i < 60; i++)
+				{
+					string line = (lines[i] == null) ? "" : lines[i].Trim();
+					if (i == 0 && line == "---")
+					{
+						inFrontMatter = true;
+						continue;
+					}
+					if (inFrontMatter)
+					{
+						if (line == "---")
+						{
+							inFrontMatter = false;
+						}
+						continue;
+					}
+					if (line.Length == 0 || line[0] == '#' || line.StartsWith("```", StringComparison.Ordinal))
+					{
+						continue;
+					}
+					string text = line.TrimStart('-', '*', '>', ' ');
+					if (text.Length > 90)
+					{
+						text = text.Substring(0, 90) + "…";
+					}
+					return text;
+				}
+			}
+			catch
+			{
+			}
+			return "";
 		}
 
 		/// <summary>统计含 SKILL.md 的技能目录数（技能包是「分类/技能名/SKILL.md」两层结构）。</summary>

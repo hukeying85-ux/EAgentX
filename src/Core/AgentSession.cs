@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using EAgentX.Engines;
+using EAgentX.Mcp;
 using EAgentX.Util;
 
 namespace EAgentX.Core
@@ -40,8 +42,23 @@ namespace EAgentX.Core
 		/// <summary>测试版：本次任务要随消息一起发送的附件（截图/上传）。</summary>
 		private string[] PendingAttachments;
 
+		/// <summary>方案三：技能库目录（list_skills / read_skill 与原生提示词用）。</summary>
+		private string SkillsDir;
+
 		/// <summary>命令审批回调，返回 false 表示用户拒绝执行。</summary>
 		public Func<string, bool> ApproveHandler;
+
+		/// <summary>方案三：流式增量文本（已做节流前的原始片段，界面自己缓冲合并）。</summary>
+		public event Action<string> AssistantDelta;
+
+		/// <summary>方案三：深度思考增量（DeepSeek Reasoner 的 reasoning_content）。</summary>
+		public event Action<string> ReasoningDelta;
+
+		/// <summary>方案三：MCP 外部工具管理器（由界面注入；为 null 时不加载 MCP 工具）。</summary>
+		public McpManager Mcp;
+
+		/// <summary>方案三：本次会话是否走了原生工具调用路径。</summary>
+		public bool NativeToolsActive { get; private set; }
 
 		public IChatEngine Engine { get; private set; }
 
@@ -69,7 +86,13 @@ namespace EAgentX.Core
 			Engine = engine;
 			Runner = new PowerShellRunner(settings.WorkDir, settings.CommandTimeoutSec);
 			// 测试版：先把技能包解压到工作目录，提示词里会带上技能库路径
-			Skills.Ensure(settings);
+			string skillsDir = Skills.Ensure(settings);
+			SkillsDir = ((skillsDir == null) ? Path.Combine(settings.WorkDir, ".eagentx", "skills") : skillsDir);
+			ApiEngine apiSetup = engine as ApiEngine;
+			if (apiSetup != null)
+			{
+				apiSetup.SetSkillsDir(SkillsDir);
+			}
 			// 窗口截图被遮挡时的浏览器兜底：走 CDP 页面截图，不依赖窗口是否可见
 			WebEngine web = engine as WebEngine;
 			if (web != null)
@@ -118,6 +141,26 @@ namespace EAgentX.Core
 			return info;
 		}
 
+		/// <summary>
+		/// 方案三：新建会话。必须同时重置 HasRun（否则首轮只发「新任务」追问模板、丢掉系统提示词）
+		/// 和引擎侧历史（API 模式之前根本不清 Messages）。MCP 连接也一并断开，下次任务重新握手。
+		/// </summary>
+		public async Task ResetAsync(CancellationToken ct)
+		{
+			HasRun = false;
+			ContinueNudges = 0;
+			PendingAttachments = null;
+			LastReplyAt = DateTime.MinValue;
+			NativeToolsActive = false;
+			// 注意：不在这里 Reset 共享的 McpManager —— 上一次会话的 AgentSession 可能还在后台收尾，
+			// 提前断开会让它正在执行的工具调用失败。MCP 会在每次新任务开始时按最新配置重新连接。
+			if (Engine != null)
+			{
+				await Engine.ResetAsync(ct).ConfigureAwait(false);
+			}
+			WriteLine("## 系统\r\n\r\n已开启新会话（上下文已清空）。\r\n");
+		}
+
 		public async Task RunTaskAsync(string task, CancellationToken ct)
 		{
 			if (!Started)
@@ -126,6 +169,18 @@ namespace EAgentX.Core
 			}
 			Raise(UserMessage, task);
 			WriteLine("## 用户\r\n\r\n" + task + "\r\n");
+			// 方案三：引擎支持原生工具且设置里打开时，走结构化工具调用循环；
+			// 否则（网页版 / 用户关掉原生工具）100% 保持原来的文本代码块协议。
+			IToolChatEngine toolEngine = Engine as IToolChatEngine;
+			if (toolEngine != null && toolEngine.UseNativeTools)
+			{
+				HasRun = true;
+				ContinueNudges = 0;
+				PendingAttachments = null;
+				LastReplyAt = DateTime.MinValue;
+				await RunNativeTaskAsync(toolEngine, task, ct).ConfigureAwait(false);
+				return;
+			}
 			string outbound = (HasRun ? ("【新任务】\r\n" + task + "\r\n\r\n（继续遵守之前的格式：每条回复只给一个工具代码块，通常是 ```powershell；块里可以写多条语句；完成后输出 [TASK_DONE]。）") : PromptBuilder.FirstTask(S, task));
 			HasRun = true;
 			ContinueNudges = 0;
@@ -305,6 +360,295 @@ namespace EAgentX.Core
 			Raise(StateChanged, tip);
 			Log.Dim(tip);
 			WriteLine("## 系统\r\n\r\n" + tip + "\r\n");
+		}
+
+		// ================= 方案三：原生 Function Calling 主循环 =================
+
+		/// <summary>
+		/// 原生工具模式：一轮里模型可能同时（或连续多轮）调用多个工具，只有当它不再返回 tool_calls 时才代表回答完毕。
+		/// 关键纪律：每一个 tool_call_id 都必须回一条 role:"tool" 消息（被拒绝也要回拒绝说明），否则下一轮 API 直接 400。
+		/// </summary>
+		private async Task RunNativeTaskAsync(IToolChatEngine engine, string task, CancellationToken ct)
+		{
+			NativeToolsActive = true;
+			string skillsDir = SkillsDir;
+			List<ToolDefinition> builtIn = BuiltInToolSchemas.Build(S, skillsDir);
+			List<ToolDefinition> tools = new List<ToolDefinition>(builtIn);
+			if (Mcp != null)
+			{
+				try
+				{
+					// 只连一次：失败就把 MCP 工具从列表里去掉，本机工具照常工作
+					await Mcp.EnsureConnectedAsync(ct).ConfigureAwait(false);
+					List<ToolDefinition> external = Mcp.ToolDefinitions();
+					tools.AddRange(external);
+					Log.Dim(Mcp.Diagnostics);
+					WriteLine("## MCP\r\n\r\n" + Mcp.Diagnostics + "\r\n");
+				}
+				catch (OperationCanceledException)
+				{
+					throw;
+				}
+				catch (Exception ex)
+				{
+					Log.Error("加载 MCP 工具失败: " + ex.Message);
+				}
+			}
+			Raise(StateChanged, "原生工具模式：已装载 " + tools.Count + " 个工具…");
+
+			string userText = task;
+			string[] attachments = null;
+			List<ToolCallResponse> toolOutputs = null;
+			List<ToolCallRequest> lastCalls = null;
+			int round = 0;
+			while (round < S.MaxSteps)
+			{
+				ct.ThrowIfCancellationRequested();
+				round++;
+				int intervalMs = NextIntervalMs();
+				if (intervalMs > 0 && LastReplyAt != DateTime.MinValue && round > 1)
+				{
+					int waitMs = intervalMs - (int)(DateTime.Now - LastReplyAt).TotalMilliseconds;
+					if (waitMs > intervalMs)
+					{
+						waitMs = intervalMs;
+					}
+					if (waitMs > 0)
+					{
+						Raise(StateChanged, "发送间隔：等待 " + (waitMs + 999) / 1000 + " 秒…");
+						await Task.Delay(waitMs, ct).ConfigureAwait(false);
+					}
+				}
+				Raise(StateChanged, "第 " + round + " 步：等待模型回复" + (S.ApiStream ? "（流式）" : "") + "…");
+				// 深度思考是「过程」不是「答案」：只写进日志，不占用助手正文，
+				// 这样模型只回了 reasoning_content 时也不会被判成空回复。
+				ChatTurnResponse turn = await engine.SendTurnAsync(userText, attachments, toolOutputs, tools, OnDelta, OnReasoning, ct).ConfigureAwait(false);
+				userText = null;
+				attachments = null;
+				toolOutputs = null;
+				LastReplyAt = DateTime.Now;
+
+				string reply = (turn.Content == null) ? "" : turn.Content.Trim();
+				if (reply.Length > 0)
+				{
+					Raise(AssistantMessage, reply);
+					WriteLine("## 助手（第 " + round + " 步）\r\n\r\n" + reply + "\r\n");
+				}
+				if (!turn.HasToolCalls && reply.Length == 0)
+				{
+					string reasoning = (turn.ReasoningContent == null) ? "" : turn.ReasoningContent.Trim();
+					if (reasoning.Length == 0)
+					{
+						throw new Exception("模型返回了空内容（既没有正文也没有工具调用），请重试。");
+					}
+					// 只有思考内容：当成这一轮的回答展示出来，不让用户看到空白
+					Raise(AssistantMessage, reasoning);
+					WriteLine("## 助手（第 " + round + " 步 · 仅思考）\r\n\r\n" + reasoning + "\r\n");
+				}
+
+				if (!turn.HasToolCalls)
+				{
+					// 原生工具模式下不再强求 [TASK_DONE]：没有再要工具就是本轮回答完毕
+					Raise(StateChanged, "任务完成");
+					return;
+				}
+
+				lastCalls = turn.ToolCalls;
+				Raise(StateChanged, "模型请求 " + lastCalls.Count + " 个工具调用…");
+				List<ToolCallResponse> outputs = new List<ToolCallResponse>();
+				for (int i = 0; i < lastCalls.Count; i++)
+				{
+					ct.ThrowIfCancellationRequested();
+					ToolCallRequest call = lastCalls[i];
+					ToolCallResponse output = await ExecuteToolCallAsync(call, ct).ConfigureAwait(false);
+					outputs.Add(output);
+				}
+				toolOutputs = outputs;
+			}
+			string tip = PromptBuilder.MaxStepsReached(S.MaxSteps);
+			Raise(StateChanged, tip);
+			Log.Dim(tip);
+			WriteLine("## 系统\r\n\r\n" + tip + "\r\n");
+		}
+
+		private void OnDelta(string delta)
+		{
+			Action<string> handler = AssistantDelta;
+			if (handler == null || string.IsNullOrEmpty(delta))
+			{
+				return;
+			}
+			try
+			{
+				handler(delta);
+			}
+			catch
+			{
+			}
+		}
+
+		private void OnReasoning(string delta)
+		{
+			Action<string> handler = ReasoningDelta;
+			if (handler == null || string.IsNullOrEmpty(delta))
+			{
+				return;
+			}
+			try
+			{
+				handler(delta);
+			}
+			catch
+			{
+			}
+		}
+
+		/// <summary>执行单个工具调用：审批 → 本机工具 / MCP 工具 → 文本回包（永不抛给模型空 id）。</summary>
+		private async Task<ToolCallResponse> ExecuteToolCallAsync(ToolCallRequest call, CancellationToken ct)
+		{
+			string name = (call.Name == null) ? "" : call.Name;
+			string rawArgs = (call.ArgumentsJson == null) ? "" : call.ArgumentsJson;
+			Dictionary<string, object> args = Json.Obj(Json.Decode(rawArgs));
+			if (args == null && rawArgs.Trim().Length > 0)
+			{
+				return new ToolCallResponse(call.Id, name, "【参数解析失败】函数参数不是合法 JSON，请重新调用并给出合法 JSON：" + rawArgs, false);
+			}
+			if (args == null)
+			{
+				args = new Dictionary<string, object>();
+			}
+
+			// ① 审批：本机副作用工具一律走 ApproveHandler；MCP 工具看 RequireApproval
+			bool needApproval = false;
+			bool isMcp = (Mcp != null) && Mcp.IsMcpTool(name);
+			McpToolRoute route = isMcp ? Mcp.Find(name) : null;
+			if (BuiltInToolSchemas.RequiresApproval(name))
+			{
+				needApproval = true;
+			}
+			else if (route != null && route.RequireApproval)
+			{
+				needApproval = true;
+			}
+			string preview = DescribeCall(name, args);
+			Raise(CommandStarted, preview);
+			WriteLine("## 工具调用（" + name + "）\r\n\r\n```json\r\n" + rawArgs + "\r\n```\r\n");
+			if (!BuiltInToolSchemas.IsBuiltIn(name) && route == null)
+			{
+				WriteLine("## 系统\r\n\r\n未知工具，已拒绝：" + name + "\r\n");
+				Raise(StateChanged, "工具 " + name + " 不存在，已把说明回给模型");
+				return new ToolCallResponse(call.Id, name, "【工具不存在】没有名为 " + name + " 的工具，请只使用请求里提供的工具。", false);
+			}
+			if (needApproval && ApproveHandler != null && !ApproveHandler(preview))
+			{
+				WriteLine("## 审批\r\n\r\n用户拒绝执行该工具调用。\r\n");
+				Raise(StateChanged, "工具调用被拒绝，已把结果告知模型");
+				return new ToolCallResponse(call.Id, name, "【用户拒绝执行】用户没有允许执行这次 " + name + " 调用，请不要重复同样的操作，换一种更安全的方式或直接向用户说明原因。", false);
+			}
+
+			// ② 执行
+			Raise(StateChanged, "执行工具：" + name + "…");
+			long startedAt = Environment.TickCount;
+			string text;
+			bool ok;
+			string[] files = null;
+			try
+			{
+				if (route != null)
+				{
+					McpCallResult mcpResult = await Mcp.CallAsync(name, rawArgs, ct).ConfigureAwait(false);
+					text = mcpResult.Text;
+					ok = !mcpResult.IsError;
+					if (!ok)
+					{
+						text = "【MCP 工具返回错误】" + text;
+					}
+				}
+				else
+				{
+					ToolExecResult exec = await Task.Run(delegate
+					{
+						return BuiltInToolSchemas.Execute(S, SkillsDir, Runner, name, args, ct);
+					}, ct).ConfigureAwait(false);
+					text = exec.Text;
+					ok = exec.Ok;
+					files = exec.Attachments;
+					if (exec.Denied)
+					{
+						ok = false;
+					}
+				}
+			}
+			catch (OperationCanceledException)
+			{
+				throw;
+			}
+			catch (Exception ex)
+			{
+				text = "【工具执行失败】" + ex.Message;
+				ok = false;
+			}
+
+			RunResult shown = new RunResult();
+			shown.Command = preview;
+			shown.ExitCode = ok ? 0 : 1;
+			shown.Output = text;
+			shown.ElapsedMs = Environment.TickCount - startedAt;
+			Raise(CommandFinished, shown);
+			WriteLine("## 工具结果\r\n\r\n" + (text == null ? "" : text) + "\r\n");
+			if (!ok)
+			{
+				Log.Error("工具执行失败：" + name + " → " + Shorten(text));
+			}
+
+			ToolCallResponse response = new ToolCallResponse(call.Id, name, (text == null) ? "" : text, ok);
+			response.Attachments = files;
+			return response;
+		}
+
+		/// <summary>审批窗口里显示的调用摘要（先给一句人话，再给完整参数）。</summary>
+		private static string DescribeCall(string name, Dictionary<string, object> args)
+		{
+			StringBuilder sb = new StringBuilder();
+			sb.Append("【").Append(name).Append("】");
+			if (name == BuiltInToolSchemas.RunPowerShell)
+			{
+				string description = BuiltInToolSchemas.ArgStr(args, "description", "");
+				if (description.Length > 0)
+				{
+					sb.Append(description).Append("\r\n\r\n");
+				}
+				sb.Append(BuiltInToolSchemas.ArgStr(args, "command", ""));
+				return sb.ToString();
+			}
+			if (name == BuiltInToolSchemas.MouseClick)
+			{
+				sb.Append("坐标 (").Append(BuiltInToolSchemas.ArgInt(args, "x", 0)).Append(",")
+					.Append(BuiltInToolSchemas.ArgInt(args, "y", 0)).Append(") 动作 ")
+					.Append(BuiltInToolSchemas.ArgStr(args, "action", "left"));
+				return sb.ToString();
+			}
+			if (name == BuiltInToolSchemas.KeyboardPress)
+			{
+				sb.Append("键盘 ").Append(BuiltInToolSchemas.ArgStr(args, "keys", ""));
+				return sb.ToString();
+			}
+			sb.Append(Json.Encode(args));
+			return sb.ToString();
+		}
+
+		private static string Shorten(string text)
+		{
+			if (string.IsNullOrEmpty(text))
+			{
+				return "";
+			}
+			string flat = text.Replace("\r", " ").Replace("\n", " ").Trim();
+			if (flat.Length <= 300)
+			{
+				return flat;
+			}
+			return flat.Substring(0, 300) + "…";
 		}
 
 		private void WriteLine(string text)

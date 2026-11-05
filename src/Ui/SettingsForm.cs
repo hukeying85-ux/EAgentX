@@ -1,15 +1,19 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Threading;
 using System.Windows.Forms;
 using EAgentX.Core;
+using EAgentX.Engines;
+using EAgentX.Mcp;
 using EAgentX.Util;
 
 namespace EAgentX.Ui
 {
 	/// <summary>
 	/// 设置窗口。编辑器里改的是一份副本（S = settings.Clone()），点「取消」不会落盘。
-	/// 两个页签：常规、高级（网页选择器）。
+	/// 三个页签：常规、高级（网页选择器）、MCP 工具。
 	/// 业务逻辑与原来完全一致，只重做了排版、控件外观、分区标题和间距。
 	/// </summary>
 	public class SettingsForm : Form
@@ -59,6 +63,20 @@ namespace EAgentX.Ui
 
 		private CheckBox StealthBox;
 
+		/// <summary>方案三：原生工具 / 流式 / 视觉开关。</summary>
+		private CheckBox NativeToolsBox;
+
+		private CheckBox StreamBox;
+
+		private CheckBox VisionBox;
+
+		/// <summary>方案三：「MCP 工具」页签里的 JSON 编辑框与测试结果。</summary>
+		private TextBox McpJsonBox;
+
+		private Label McpResultLabel;
+
+		private McpManager TestManager;
+
 		private TextBox SelInputBox;
 
 		private TextBox SelSendBox;
@@ -98,6 +116,7 @@ namespace EAgentX.Ui
 			tabStrip.Dock = DockStyle.Top;
 			tabStrip.Titles.Add("常规");
 			tabStrip.Titles.Add("高级");
+			tabStrip.Titles.Add("MCP 工具");
 			Theme.StyleSurface(tabStrip, ThemeRole.Panel);
 
 			ModernScrollHost basicHost = new ModernScrollHost();
@@ -109,10 +128,16 @@ namespace EAgentX.Ui
 			Theme.StyleSurface(selectorHost, ThemeRole.Bg);
 			selectorHost.Visible = false;
 
+			ModernScrollHost mcpHost = new ModernScrollHost();
+			mcpHost.Dock = DockStyle.Fill;
+			Theme.StyleSurface(mcpHost, ThemeRole.Bg);
+			mcpHost.Visible = false;
+
 			tabStrip.SelectedIndexChanged += delegate
 			{
 				basicHost.Visible = (tabStrip.SelectedIndex == 0);
 				selectorHost.Visible = (tabStrip.SelectedIndex == 1);
+				mcpHost.Visible = (tabStrip.SelectedIndex == 2);
 			};
 
 			// ---------- 常规 ----------
@@ -215,6 +240,32 @@ namespace EAgentX.Ui
 			Theme.StyleInput(ApiModelBox);
 			AddRow(basicTable, "模型名", ApiModelBox, 36);
 
+			NativeToolsBox = new ModernCheckBox();
+			NativeToolsBox.Text = "启用原生 Tool Calling（推荐：结构化函数调用，多工具并行）";
+			Theme.StyleCheck(NativeToolsBox);
+			NativeToolsBox.AutoSize = true;
+			AddRow(basicTable, "", NativeToolsBox, 32);
+			Tip.Attach(NativeToolsBox, "关闭后回到旧的文本代码块协议（兼容不支持 tools 参数的网关）");
+
+			StreamBox = new ModernCheckBox();
+			StreamBox.Text = "启用流式逐字输出（SSE）";
+			Theme.StyleCheck(StreamBox);
+			StreamBox.AutoSize = true;
+			AddRow(basicTable, "", StreamBox, 32);
+			Tip.Attach(StreamBox, "服务端不支持时自动降级为非流式一次性返回");
+
+			VisionBox = new ModernCheckBox();
+			VisionBox.Text = "模型支持视觉图片输入（开启后截图会作为图片一起发送）";
+			Theme.StyleCheck(VisionBox);
+			VisionBox.AutoSize = true;
+			AddRow(basicTable, "", VisionBox, 32);
+			Tip.Attach(VisionBox, "deepseek-chat 等纯文本模型请保持关闭，否则截图 image_url 会被接口拒绝");
+
+			Label apiHint = Theme.Label("原生工具需要模型支持 function calling（DeepSeek / GPT / Claude 兼容网关均支持；本地 Ollama 需相应模型）。截图工具在角色为 tool 的消息里永远只回纯文本，视觉开关只是额外追加一条图片消息。", Theme.UiFontSmall, Theme.Dim);
+			apiHint.MaximumSize = Ui.Sz(520, 0);
+			apiHint.AutoSize = true;
+			AddFullWidthRow(basicTable, apiHint);
+
 			AddSectionRow(basicTable, "提示词");
 			SysPromptBox = new TextBox();
 			SysPromptBox.Multiline = true;
@@ -268,6 +319,88 @@ namespace EAgentX.Ui
 			AddRow(selectorTable, "登录标志", SelLoginBox, 36);
 
 			selectorHost.Content = selectorTable;
+
+			// ---------- MCP 工具 ----------
+			TableLayoutPanel mcpTable = BuildTable();
+
+			Label mcpHint = Theme.Label("在这里粘贴标准 mcpServers JSON（Claude Desktop / Cursor 的配置可直接复用）。支持 stdio（command + args，会启动本地子进程）与 http（url）两种传输；工具会以 mcp__<server>__<tool> 的名字交给模型。", Theme.UiFontSmall, Theme.Dim);
+			mcpHint.MaximumSize = Ui.Sz(520, 0);
+			mcpHint.AutoSize = true;
+			AddFullWidthRow(mcpTable, mcpHint);
+
+			McpJsonBox = new TextBox();
+			McpJsonBox.Multiline = true;
+			McpJsonBox.ScrollBars = ScrollBars.Both;
+			McpJsonBox.WordWrap = false;
+			McpJsonBox.AcceptsReturn = true;
+			McpJsonBox.AcceptsTab = true;
+			McpJsonBox.Font = Theme.MonoFont;
+			Theme.StyleInput(McpJsonBox);
+			McpJsonBox.Text = McpConfig.SampleJson;
+			AddRow(mcpTable, "mcpServers", McpJsonBox, 240);
+
+			McpResultLabel = Theme.Label("", Theme.UiFontSmall, Theme.Dim);
+			McpResultLabel.AutoSize = false;
+			McpResultLabel.MaximumSize = Ui.Sz(520, 0);
+			McpResultLabel.Height = Ui.P(96);
+			McpResultLabel.TextAlign = ContentAlignment.TopLeft;
+			AddFullWidthRow(mcpTable, McpResultLabel);
+
+			Button mcpTestButton = new ModernButton();
+			mcpTestButton.Text = "测试连接并列出工具";
+			mcpTestButton.Size = Ui.Sz(170, 32);
+			mcpTestButton.Margin = Ui.Pad(3, 4, 3, 4);
+			Theme.StyleButton(mcpTestButton, accent: false);
+			mcpTestButton.Click += delegate
+			{
+				TestMcpConnection();
+			};
+
+			Button mcpSampleButton = new ModernButton();
+			mcpSampleButton.Text = "填入示例配置";
+			mcpSampleButton.Size = Ui.Sz(130, 32);
+			mcpSampleButton.Margin = Ui.Pad(3, 4, 3, 4);
+			Theme.StyleButton(mcpSampleButton, accent: false);
+			mcpSampleButton.Click += delegate
+			{
+				McpJsonBox.Text = McpConfig.SampleJson;
+				if (McpResultLabel != null)
+				{
+					McpResultLabel.Text = "已填入示例。把 command / args / url 改成你自己的 Server 后点「测试连接并列出工具」。";
+				}
+			};
+
+			Button mcpOpenButton = new ModernButton();
+			mcpOpenButton.Text = "打开配置目录";
+			mcpOpenButton.Size = Ui.Sz(130, 32);
+			mcpOpenButton.Margin = Ui.Pad(3, 4, 3, 4);
+			Theme.StyleButton(mcpOpenButton, accent: false);
+			mcpOpenButton.Click += delegate
+			{
+				try
+				{
+					if (!Directory.Exists(Settings.Dir))
+					{
+						Directory.CreateDirectory(Settings.Dir);
+					}
+					System.Diagnostics.Process.Start("explorer.exe", Settings.Dir);
+				}
+				catch (Exception ex)
+				{
+					McpResultLabel.Text = "打开目录失败: " + ex.Message;
+				}
+			};
+
+			FlowLayoutPanel mcpActions = new FlowLayoutPanel();
+			mcpActions.AutoSize = true;
+			mcpActions.WrapContents = true;
+			mcpActions.Margin = Ui.Pad(3, 0, 3, 6);
+			mcpActions.Controls.Add(mcpTestButton);
+			mcpActions.Controls.Add(mcpSampleButton);
+			mcpActions.Controls.Add(mcpOpenButton);
+			AddFullWidthRow(mcpTable, mcpActions);
+
+			mcpHost.Content = mcpTable;
 
 			// ---------- 底部按钮栏 ----------
 			Panel footer = new Panel();
@@ -331,6 +464,7 @@ namespace EAgentX.Ui
 			footerLayout.Controls.Add(actions, 1, 0);
 			footer.Controls.Add(footerLayout);
 
+			base.Controls.Add(mcpHost);
 			base.Controls.Add(selectorHost);
 			base.Controls.Add(basicHost);
 			base.Controls.Add(tabStrip);
@@ -489,6 +623,17 @@ namespace EAgentX.Ui
 			ApiBaseBox.Text = S.ApiBase;
 			ApiKeyBox.Text = S.ApiKey;
 			ApiModelBox.Text = S.ApiModel;
+			NativeToolsBox.Checked = S.ApiNativeTools;
+			StreamBox.Checked = S.ApiStream;
+			VisionBox.Checked = S.ApiVisionEnabled;
+			try
+			{
+				McpJsonBox.Text = File.Exists(McpConfig.FilePath) ? File.ReadAllText(McpConfig.FilePath) : McpConfig.SampleJson;
+			}
+			catch
+			{
+				McpJsonBox.Text = McpConfig.SampleJson;
+			}
 			BuiltInPrompt = PromptBuilder.BuiltIn(S);
 			SysPromptBox.Text = (string.IsNullOrEmpty(S.SystemPrompt) ? BuiltInPrompt : PromptBuilder.RefreshRuntimeLines(S.SystemPrompt, S));
 			SelInputBox.Text = S.Sel.Input;
@@ -496,6 +641,94 @@ namespace EAgentX.Ui
 			SelReplyBox.Text = S.Sel.Reply;
 			SelGeneratingBox.Text = S.Sel.Generating;
 			SelLoginBox.Text = S.Sel.Login;
+		}
+
+		/// <summary>
+		/// 「测试连接并列出工具」：用编辑框里的 JSON 真连一次（不落盘），
+		/// 把每个 Server 的握手结果与工具清单显示在结果标签里。
+		/// </summary>
+		private void TestMcpConnection()
+		{
+			string json = (McpJsonBox.Text ?? "").Trim();
+			List<McpServerEntry> entries;
+			try
+			{
+				entries = McpConfig.Parse(json);
+			}
+			catch (Exception ex)
+			{
+				McpResultLabel.Text = "JSON 解析失败：" + ex.Message;
+				return;
+			}
+			if (entries.Count == 0)
+			{
+				McpResultLabel.Text = "配置里没有任何 mcpServers。";
+				return;
+			}
+			if (TestManager != null)
+			{
+				try
+				{
+					TestManager.Dispose();
+				}
+				catch
+				{
+				}
+				TestManager = null;
+			}
+			McpResultLabel.Text = "正在连接 " + entries.Count + " 个 MCP Server…";
+			McpManager manager = new McpManager();
+			TestManager = manager;
+			ShowBusy(true);
+			ThreadPool.QueueUserWorkItem(delegate(object state)
+			{
+				string report;
+				try
+				{
+					report = manager.LoadAndConnectAsync(entries, CancellationToken.None).Result;
+					List<ToolDefinition> tools = manager.ToolDefinitions();
+					if (tools.Count > 0)
+					{
+						System.Text.StringBuilder sb = new System.Text.StringBuilder(report);
+						sb.AppendLine();
+						sb.AppendLine("可用工具：");
+						for (int i = 0; i < tools.Count; i++)
+						{
+							sb.AppendLine("- " + tools[i].Name);
+						}
+						report = sb.ToString();
+					}
+				}
+				catch (Exception ex)
+				{
+					report = "连接失败：" + ex.Message;
+				}
+				try
+				{
+					BeginInvoke((Action)delegate
+					{
+						if (McpResultLabel != null && !McpResultLabel.IsDisposed)
+						{
+							McpResultLabel.Text = report;
+						}
+						ShowBusy(false);
+					});
+				}
+				catch
+				{
+				}
+			});
+		}
+
+		private void ShowBusy(bool busy)
+		{
+			try
+			{
+				base.UseWaitCursor = busy;
+			}
+			catch
+			{
+			}
 		}
 
 		private void BrowseWorkDir(object sender, EventArgs e)
@@ -516,6 +749,22 @@ namespace EAgentX.Ui
 					}
 				}
 			}
+		}
+
+		protected override void OnFormClosed(FormClosedEventArgs e)
+		{
+			if (TestManager != null)
+			{
+				try
+				{
+					TestManager.Dispose();
+				}
+				catch
+				{
+				}
+				TestManager = null;
+			}
+			base.OnFormClosed(e);
 		}
 
 		private void BrowseBrowser(object sender, EventArgs e)
@@ -567,6 +816,28 @@ namespace EAgentX.Ui
 			S.ApiBase = ApiBaseBox.Text.Trim();
 			S.ApiKey = ApiKeyBox.Text.Trim();
 			S.ApiModel = ApiModelBox.Text.Trim();
+			S.ApiNativeTools = NativeToolsBox.Checked;
+			S.ApiStream = StreamBox.Checked;
+			S.ApiVisionEnabled = VisionBox.Checked;
+			// MCP 配置：先校验 JSON，不合法就不让保存（避免把主流程拖进一个永远连不上的配置）
+			string mcpText = (McpJsonBox.Text ?? "").Trim();
+			if (mcpText.Length > 0)
+			{
+				try
+				{
+					McpConfig.Parse(mcpText);
+				}
+				catch (Exception ex)
+				{
+					MessageDialog.Show(this, "MCP 配置不是合法的 mcpServers JSON：" + ex.Message, "EAgentX", MessageBoxIcon.Exclamation, MessageBoxButtons.OK);
+					return;
+				}
+			}
+			if (mcpText.Length == 0)
+			{
+				mcpText = "{\r\n  \"mcpServers\": {}\r\n}";
+			}
+			McpConfig.SaveText(mcpText);
 			string promptText = SysPromptBox.Text.Trim();
 			if (promptText.Length == 0 || promptText == BuiltInPrompt.Trim())
 			{

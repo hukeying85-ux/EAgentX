@@ -58,6 +58,14 @@
 - 网页版 DeepSeek 驱动：连接浏览器里的网页会话，不需要 API Key；也支持 OpenAI 兼容 API。
 - PowerShell 执行、截图 / 文件 / 鼠标 / 键盘工具、技能库、浏览器嵌入、随机发送间隔。
 - 默认每条命令都要确认；可在设置里关闭确认或关闭扩展工具。
+- **（方案三）API 模式原生 Tool Calling**：`run_powershell` / `capture_screenshot` /
+  `attach_local_file` / `mouse_click` / `keyboard_press` / `list_skills` / `read_skill`
+  以标准 JSON Schema 交给模型，一轮可并行多个工具调用，审批逻辑不变。
+- **（方案三）SSE 逐字流式**：API 模式边生成边显示（70ms 合并节流），深度思考内容一并展示；
+  网关不支持流式时自动降级。
+- **（方案三）MCP 工具接入**：设置 →「MCP 工具」里粘贴标准 `mcpServers` JSON
+  （Claude Desktop / Cursor 的配置可直接复用），支持 stdio 子进程与 http 两种传输，
+  外部工具自动映射为 `mcp__<server>__<tool>`。
 
 ## 运行
 
@@ -81,7 +89,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Csc "$env:WINDI
 .\dist\EAgentX.exe --shotcheck
 ```
 
-源码保持 C# 5，Windows 自带 `csc.exe` 和 Roslyn 两条链路都能编译，零警告。详细说明见
+源码保持 C# 5，Windows 自带 `csc.exe` 和 Roslyn 两条链路都能编译，零警告。
+提交前可先跑一遍语法守卫（Linux / macOS / Windows 都能跑）：
+
+```bash
+python3 tools/verify-cs5.py
+```
+详细说明见
 [`docs/UI版说明.md`](docs/UI版说明.md)，技能清单见 [`docs/技能包清单.md`](docs/技能包清单.md)。
 
 ## 致谢与出处

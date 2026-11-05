@@ -26,7 +26,7 @@ namespace EAgentX
 	///   --uploadcheck [file]    网页附件上传
 	/// 所有结果都会写进 exe 同目录的 *.log，并用退出码表示成功（0）/失败（1）。
 	/// </summary>
-	public static class SelfTest
+	public static partial class SelfTest
 	{
 		private sealed class Runner
 		{
@@ -112,6 +112,11 @@ namespace EAgentX
 				return Task.FromResult("[TASK_DONE] 完成");
 			}
 
+			public Task ResetAsync(CancellationToken ct)
+			{
+				return Task.FromResult(0);
+			}
+
 			public void Dispose()
 			{
 			}
@@ -160,6 +165,11 @@ namespace EAgentX
 				return Task.FromResult("[TASK_DONE] 完成");
 			}
 
+			public Task ResetAsync(CancellationToken ct)
+			{
+				return Task.FromResult(0);
+			}
+
 			public void Dispose()
 			{
 			}
@@ -195,6 +205,11 @@ namespace EAgentX
 			{
 				Sends++;
 				return Task.FromResult("[NEED_INPUT] 请问要把文件放在哪个目录？");
+			}
+
+			public Task ResetAsync(CancellationToken ct)
+			{
+				return Task.FromResult(0);
 			}
 
 			public void Dispose()
@@ -248,6 +263,11 @@ namespace EAgentX
 					return Task.FromResult("我先截个屏看看。\r\n```agent_getjpg\r\n# tool_取屏幕截图_调用工具_识别头_本行注释一定要完全保留\r\nagent_getjpg_1_star(屏幕)_1_getjpg_end\r\n# tool_取屏幕截图_调用工具_识别尾_本行注释一定要完全保留\r\n```");
 				}
 				return Task.FromResult("[TASK_DONE] 完成");
+			}
+
+			public Task ResetAsync(CancellationToken ct)
+			{
+				return Task.FromResult(0);
 			}
 
 			public void Dispose()
@@ -791,6 +811,9 @@ namespace EAgentX
 					Assert(delayForm.Seconds == 5 && delayForm.MaxSeconds == 8, "发送间隔窗口构造失败");
 				}
 			});
+
+			// 方案三：原生 Tool Calling / SSE 流式 / MCP 离线自检
+			RunNativeToolTests(r);
 
 			r.Write("HEAD", "自检结束: 通过 " + r.Pass + " 项，失败 " + r.Fail + " 项");
 			try

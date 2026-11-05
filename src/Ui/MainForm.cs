@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using EAgentX.Core;
 using EAgentX.Engines;
+using EAgentX.Mcp;
 using EAgentX.Net;
 using EAgentX.Util;
 
@@ -63,6 +64,23 @@ namespace EAgentX.Ui
 
 		/// <summary>浏览器窗口被重新 parent 后 Chromium 会异步重排，这里延时再校准一次尺寸。</summary>
 		private System.Windows.Forms.Timer EmbedRelayoutTimer;
+
+		/// <summary>方案三：跨会话共享的 MCP 管理器（只读配置 + 子进程句柄都放在这里）。</summary>
+		private readonly McpManager Mcp = new McpManager();
+
+		/// <summary>方案三：流式增量缓冲（70ms 合并一次，避免 RichTextBox 每个 token 重绘导致卡死/闪烁）。</summary>
+		private readonly StringBuilder StreamBuffer = new StringBuilder();
+
+		private readonly object StreamGate = new object();
+
+		/// <summary>流式缓冲定时器：把 StreamBuffer 里的增量刷进日志框。</summary>
+		private System.Windows.Forms.Timer StreamTimer;
+
+		/// <summary>正在排队创建定时器（防止每个 token 都 BeginInvoke 一次）。</summary>
+		private volatile bool StreamTimerPending;
+
+		/// <summary>当前这一轮流式文本是否已经开过「助手」标题与段落。</summary>
+		private bool StreamBlockOpen;
 
 		/// <summary>WS_MAXIMIZE：最大化窗口 SetParent 后无法被 MoveWindow 缩小，会导致只显示一部分。</summary>
 		private const int WS_MAXIMIZE = 0x01000000;
@@ -894,6 +912,180 @@ namespace EAgentX.Ui
 			TrimLog();
 		}
 
+		// ================= 方案三：流式渲染（70ms 合并节流） =================
+
+		/// <summary>
+		/// 引擎线程的流式回调：只往缓冲区里塞，绝不直接碰控件。
+		/// 由 70ms 定时器在 UI 线程上一次性追加，避免逐 token AppendText 造成的卡顿与闪烁。
+		/// </summary>
+		private void OnAssistantDelta(string delta)
+		{
+			if (string.IsNullOrEmpty(delta) || base.IsDisposed)
+			{
+				return;
+			}
+			lock (StreamGate)
+			{
+				StreamBuffer.Append(delta);
+			}
+			EnsureStreamTimer();
+		}
+
+		private void EnsureStreamTimer()
+		{
+			if (StreamTimer != null || StreamTimerPending)
+			{
+				return;
+			}
+			if (base.IsDisposed || !base.IsHandleCreated)
+			{
+				return;
+			}
+			StreamTimerPending = true;
+			try
+			{
+				BeginInvoke((Action)delegate
+				{
+					StreamTimerPending = false;
+					if (StreamTimer != null || base.IsDisposed)
+					{
+						return;
+					}
+					StreamTimer = new System.Windows.Forms.Timer();
+					StreamTimer.Interval = 70;
+					StreamTimer.Tick += delegate
+					{
+						FlushStream();
+					};
+					StreamTimer.Start();
+				});
+			}
+			catch
+			{
+				StreamTimerPending = false;
+			}
+		}
+
+		/// <summary>把缓冲区里的增量刷进日志框（在 UI 线程执行）。</summary>
+		private void FlushStream()
+		{
+			if (base.IsDisposed || LogBox == null)
+			{
+				return;
+			}
+			string pending;
+			lock (StreamGate)
+			{
+				if (StreamBuffer.Length == 0)
+				{
+					pending = null;
+				}
+				else
+				{
+					pending = StreamBuffer.ToString();
+					StreamBuffer.Length = 0;
+				}
+			}
+			if (string.IsNullOrEmpty(pending))
+			{
+				return;
+			}
+			try
+			{
+				if (!StreamBlockOpen)
+				{
+					LogBox.SelectionStart = LogBox.TextLength;
+					LogBox.SelectionLength = 0;
+					LogBox.SelectionColor = Theme.Agent;
+					LogBox.SelectionFont = Theme.UiFont;
+					LogBox.AppendText("助手\r\n");
+					StreamBlockOpen = true;
+				}
+				LogBox.SelectionStart = LogBox.TextLength;
+				LogBox.SelectionLength = 0;
+				LogBox.SelectionColor = Theme.Agent;
+				LogBox.SelectionFont = Theme.UiFont;
+				LogBox.AppendText(pending);
+				LogBox.SelectionStart = LogBox.TextLength;
+				LogBox.ScrollToCaret();
+				TrimLog();
+			}
+			catch
+			{
+			}
+		}
+
+		/// <summary>一轮结束：把剩余增量刷完并收尾段落；返回 true 表示这一轮确实流式渲染过正文。</summary>
+		private bool EndStream()
+		{
+			if (base.IsDisposed)
+			{
+				return false;
+			}
+			if (base.InvokeRequired)
+			{
+				// 事件回调在引擎线程上触发，RichTextBox 只能在 UI 线程碰，所以这里同步切回去
+				try
+				{
+					object result = Invoke((Func<bool>)EndStream);
+					return result is bool && (bool)result;
+				}
+				catch
+				{
+					return false;
+				}
+			}
+			if (StreamTimer != null)
+			{
+				FlushStream();
+			}
+			bool opened = StreamBlockOpen;
+			StreamBlockOpen = false;
+			lock (StreamGate)
+			{
+				StreamBuffer.Length = 0;
+			}
+			if (!opened || base.IsDisposed || LogBox == null)
+			{
+				return opened;
+			}
+			try
+			{
+				LogBox.SelectionStart = LogBox.TextLength;
+				LogBox.SelectionColor = Theme.Dim;
+				LogBox.SelectionFont = Theme.UiFontSmall;
+				LogBox.AppendText("\r\n\r\n");
+				LogBox.SelectionStart = LogBox.TextLength;
+				LogBox.ScrollToCaret();
+			}
+			catch
+			{
+			}
+			return opened;
+		}
+
+		/// <summary>彻底清掉流式状态（新建会话 / 关闭窗口时用）。</summary>
+		private void ResetStreamState()
+		{
+			lock (StreamGate)
+			{
+				StreamBuffer.Length = 0;
+			}
+			StreamBlockOpen = false;
+			if (StreamTimer != null)
+			{
+				try
+				{
+					StreamTimer.Stop();
+					StreamTimer.Dispose();
+				}
+				catch
+				{
+				}
+				StreamTimer = null;
+			}
+		}
+
 		private void AppendBanner()
 		{
 			AppendBlock(Theme.Text, Theme.BannerFont, "开始一个新任务");
@@ -947,14 +1139,24 @@ namespace EAgentX.Ui
 			};
 			session.AssistantMessage += delegate(string text)
 			{
-				Log.Write(LogKind.Agent, text);
+				// 流式已经逐字显示过正文，这里不再重复整段（否则日志里会出现两遍）
+				bool streamed = EndStream();
+				if (!streamed)
+				{
+					Log.Write(LogKind.Agent, text);
+				}
 			};
 			session.CommandStarted += delegate(string command)
 			{
+				// 先把这一轮已经流式显示的正文收尾，命令/工具块才不会插在句子中间
+				EndStream();
 				Log.Write(LogKind.Command, command);
 			};
 			session.CommandFinished += AppendResult;
 			session.ApproveHandler = ApproveCommand;
+			// 方案三：流式增量 + MCP 工具
+			session.Mcp = Mcp;
+			session.AssistantDelta += OnAssistantDelta;
 		}
 
 		private void OnStateChanged(string state)
@@ -1080,6 +1282,8 @@ namespace EAgentX.Ui
 				LogBox.Clear();
 			}
 			AppendBanner();
+			// 方案三：旧会话可能还残留流式缓冲，先清干净再开新的
+			ResetStreamState();
 			if (Session != null && SessionStarted)
 			{
 				WebEngine web = Session.Engine as WebEngine;
@@ -1113,7 +1317,36 @@ namespace EAgentX.Ui
 						UpdateUi();
 					}
 				}
-				Log.Write(LogKind.Info, "API 模式已就绪，直接输入任务即可。");
+				// 方案三：API 模式同样要清空引擎历史 + AgentSession.HasRun，
+				// 否则新会话首轮会丢系统提示词、旧上下文也会一直残留。
+				Connecting = true;
+				UpdateUi();
+				try
+				{
+					try
+					{
+						if (Cts == null || Cts.IsCancellationRequested)
+						{
+							Cts = new CancellationTokenSource();
+						}
+						await Task.Run(() => Session.ResetAsync(Cts.Token));
+						Mcp.Reset();
+						Log.Write(LogKind.Info, "API 模式已开启新对话（历史已清空），直接输入任务即可。");
+						return;
+					}
+					catch (Exception ex)
+					{
+						Log.Error(ex);
+						Log.Write(LogKind.Error, "开启新对话失败: " + ex.Message);
+						DisposeSession();
+						return;
+					}
+				}
+				finally
+				{
+					Connecting = false;
+					UpdateUi();
+				}
 			}
 			else
 			{
@@ -1475,6 +1708,7 @@ namespace EAgentX.Ui
 			}
 			Session = null;
 			SessionStarted = false;
+			ResetStreamState();
 		}
 
 		private CancellationToken CtsToken()
@@ -1563,6 +1797,15 @@ namespace EAgentX.Ui
 			{
 			}
 			DetachBrowser();
+			// 方案三：停掉流式定时器并断开所有 MCP 子进程（否则会把 Node 进程留在后台）
+			ResetStreamState();
+			try
+			{
+				Mcp.Dispose();
+			}
+			catch
+			{
+			}
 			// 关闭时再次保存主题；即使切换动画还没结束也按目标主题保存
 			Theme.Save();
 			try

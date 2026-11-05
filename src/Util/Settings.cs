@@ -46,6 +46,15 @@ namespace EAgentX.Util
 		/// <summary>启用截图 / 上传 / 鼠标 / 键盘工具。</summary>
 		public bool EnableTools { get; set; }
 
+		/// <summary>方案三：API 模式使用原生 Tool Calling（关闭时回到文本代码块协议）。</summary>
+		public bool ApiNativeTools { get; set; }
+
+		/// <summary>方案三：API 模式使用 SSE 流式输出（逐字显示）。</summary>
+		public bool ApiStream { get; set; }
+
+		/// <summary>方案三：模型支持视觉输入；开启后截图会以 image_url 附件追加。</summary>
+		public bool ApiVisionEnabled { get; set; }
+
 		/// <summary>连接后把 Edge 窗口嵌进主窗口。</summary>
 		public bool EmbedBrowser { get; set; }
 
@@ -105,6 +114,9 @@ namespace EAgentX.Util
 			SendIntervalSec = 3;
 			SendIntervalMaxSec = 0;
 			EnableTools = true;
+			ApiNativeTools = true;
+			ApiStream = true;
+			ApiVisionEnabled = false;
 			EmbedBrowser = false;
 			StealthFlags = true;
 			RateLimitRetries = 2;
@@ -154,6 +166,9 @@ namespace EAgentX.Util
 			copy.SendIntervalSec = SendIntervalSec;
 			copy.SendIntervalMaxSec = SendIntervalMaxSec;
 			copy.EnableTools = EnableTools;
+			copy.ApiNativeTools = ApiNativeTools;
+			copy.ApiStream = ApiStream;
+			copy.ApiVisionEnabled = ApiVisionEnabled;
 			copy.EmbedBrowser = EmbedBrowser;
 			copy.StealthFlags = StealthFlags;
 			copy.RateLimitRetries = RateLimitRetries;
