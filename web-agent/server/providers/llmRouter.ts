@@ -391,10 +391,6 @@ class AnthropicProvider implements ChatProvider {
 
 /* ------------------------------ 工厂 ------------------------------ */
 
-export class DemoProviderMarker {
-  static readonly KIND = 'demo';
-}
-
 export function createOnlineProvider(endpoint: ModelEndpoint): ChatProvider {
   if (endpoint.kind === 'anthropic') return new AnthropicProvider(endpoint);
   return new OpenAiProvider(endpoint);
