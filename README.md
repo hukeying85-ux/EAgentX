@@ -84,6 +84,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Csc "$env:WINDI
 源码保持 C# 5，Windows 自带 `csc.exe` 和 Roslyn 两条链路都能编译，零警告。详细说明见
 [`docs/UI版说明.md`](docs/UI版说明.md)，技能清单见 [`docs/技能包清单.md`](docs/技能包清单.md)。
 
+## Web 工作台（`web-agent/`）
+
+方案二的产物：在独立子目录里用 Node.js + TypeScript + React 实现了类 `arena.ai/agent` 的
+**双栏 Web 自主智能体工作台**，复用本项目的闭环内核、命令残片拦截、输出截断、技能库与会话轨迹，
+并补上工作区沙箱、内联审批、模型盲测与右侧 Live Preview。
+
+```bash
+cd web-agent
+npm install
+npm run build && npm start     # http://localhost:3001
+```
+
+- 免 API Key 即可跑通「生成多文件网页 → 真实写盘 → 右栏实时预览」；
+- 填入 OpenAI / DeepSeek / Anthropic / Ollama 端点后自动切换真实大模型；
+- 该目录 **不修改根目录任何 C# 源码、工程文件或构建脚本**。
+
+详细设计、API 与验收说明见 [`web-agent/README.md`](web-agent/README.md)。
+
 ## 致谢与出处
 
 - **原作：[YaoGaoChaoLe/EAgent](https://github.com/YaoGaoChaoLe/EAgent)**（易语言，GPL-3.0）

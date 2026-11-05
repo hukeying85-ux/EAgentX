@@ -1,0 +1,8 @@
+node_modules/
+dist/
+workspaces/
+data/*.json
+data/*.jsonl
+.env
+.env.local
+*.log
